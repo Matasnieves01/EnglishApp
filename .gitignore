@@ -1,0 +1,63 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+.project
+.settings/
+
+# IntelliJ-related
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Visual Studio Code-related
+.vscode/
+.history/
+*.code-workspace
+
+# Flutter-related
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+
+# Android-related
+android/**/gradle-wrapper.jar
+android/.gradle
+android/captures/
+android/gradlew
+android/gradlew.bat
+android/local.properties
+android/bundle/
+android/key.properties
+android/app/src/main/res/values/strings.xml
+
+# iOS-related
+ios/Flutter/Generated.xcconfig
+ios/Flutter/flutter_export_environment.sh
+ios/Flutter/Flutter.podspec
+ios/Pods/
+ios/.symlinks/
+ios/Runner/GeneratedPluginRegistrant.h
+ios/Runner/GeneratedPluginRegistrant.m
+/ios/ServiceDefinitions.json
+/ios/Runner/GoogleService-Info.plist
+
+# Symbols and carcasses
+doc/api/
+ios/DerivedData/
+
+# Executables
+*.apk
+*.aab
+*.exe
