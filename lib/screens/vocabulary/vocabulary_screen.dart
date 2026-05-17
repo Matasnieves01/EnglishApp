@@ -3,6 +3,46 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:dart_phonetics/dart_phonetics.dart';
 
+// ─── Mic error types ────────────────────────────────────────────────────────
+enum _MicError {
+  none,
+  permission,    // User denied microphone permission
+  busy,          // Mic already in use by another app
+  audio,         // Audio session / hardware error
+  network,       // Cloud STT unreachable
+  noMatch,       // Spoke but nothing recognized
+  timeout,       // Silence timeout
+  unknown,       // Any other error
+}
+
+extension _MicErrorX on _MicError {
+  String get message {
+    switch (this) {
+      case _MicError.permission:
+        return 'Microphone permission denied. Please enable it in Settings.';
+      case _MicError.busy:
+        return 'Microphone is in use by another app. Close it.';
+      case _MicError.audio:
+        return 'Audio hardware error. Restart the app.';
+      case _MicError.network:
+        return 'No internet connection for speech recognition.';
+      case _MicError.noMatch:
+        return 'Could not understand. Try speaking more clearly.';
+      case _MicError.timeout:
+        return 'No speech detected. Tap the mic.';
+      case _MicError.unknown:
+        return 'Unexpected microphone error. Tap the mic.';
+      case _MicError.none:
+        return '';
+    }
+  }
+
+
+  /// Returns true for errors that require the user to act outside the app.
+  bool get requiresSettings => this == _MicError.permission;
+}
+
+// ─── Screen ─────────────────────────────────────────────────────────────────
 class VocabularyScreen extends StatefulWidget {
   final int level;
   final List<String> words;
@@ -18,240 +58,319 @@ class VocabularyScreen extends StatefulWidget {
 }
 
 class _VocabularyScreenState extends State<VocabularyScreen>
-with SingleTickerProviderStateMixin{
+    with SingleTickerProviderStateMixin {
+  // ── Constants ──────────────────────────────────────────────────────────────
   static const int _maxAttempts = 3;
-  static const Duration _listenForDuration = Duration(seconds: 15);
-  static const Duration _pauseForDuration = Duration(seconds: 5);
+  static const Duration _listenFor = Duration(seconds: 15);
+  static const Duration _pauseFor = Duration(seconds: 3);
 
+  // ── Services ───────────────────────────────────────────────────────────────
   final FlutterTts _tts = FlutterTts();
   final stt.SpeechToText _speech = stt.SpeechToText();
 
+  // ── Animation ──────────────────────────────────────────────────────────────
   late AnimationController _animController;
-  late Animation<Color?> _borderControl;
-  late Animation<Color?> _bgColor;
+  late Animation<Color?> _borderAnim;
+  late Animation<Color?> _bgAnim;
 
+  // ── State ──────────────────────────────────────────────────────────────────
   int _currentWordIndex = 0;
   bool _isListening = false;
+  bool _speechReady = false;      // true once initialize() succeeds
+  bool _initializing = false;     // guard: prevents double-init races
   bool _correct = false;
   bool _wrong = false;
   bool _isReplaying = false;
   int _attempts = 0;
   int _wrongPulse = 0;
   String _heard = '';
-  int _correctCount = 0;
+  _MicError _micError = _MicError.none;
+
+  // Tracks which words were answered correctly / incorrectly.
+  final List<String> _correctWords = [];
+  final List<String> _wrongWords = [];
 
   String get _currentWord => widget.words[_currentWordIndex];
 
+  // ── Lifecycle ──────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
-    _animController = AnimationController(
-        vsync: this,
-      duration: const Duration(milliseconds: 850),
-    );
-    _borderControl = ColorTween(
-      begin: Colors.grey.shade200,
-      end: Colors.green.shade300,
-    ).animate(CurvedAnimation(parent: _animController, curve: Curves.easeOut));
-    _bgColor = ColorTween(
-      begin: Colors.white,
-      end: Color(0xFFEDF7ED),
-    ).animate(CurvedAnimation(parent: _animController, curve: Curves.easeOut));
+    _setupAnimation();
     _initTts();
     _initSpeech();
   }
 
+  @override
+  void dispose() {
+    _animController.dispose();
+    _tts.stop();
+    // Only call stop/cancel if the engine is actually running.
+    if (_speech.isListening) _speech.stop();
+    super.dispose();
+  }
+
+  // ── Animation setup ────────────────────────────────────────────────────────
+  void _setupAnimation() {
+    _animController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 850),
+    );
+    _borderAnim = ColorTween(
+      begin: Colors.grey.shade200,
+      end: Colors.green.shade300,
+    ).animate(CurvedAnimation(parent: _animController, curve: Curves.easeOut));
+    _bgAnim = ColorTween(
+      begin: Colors.white,
+      end: const Color(0xFFEDF7ED),
+    ).animate(CurvedAnimation(parent: _animController, curve: Curves.easeOut));
+  }
+
+  // ── TTS ────────────────────────────────────────────────────────────────────
   Future<void> _initTts() async {
     await _tts.setLanguage('en-US');
     await _tts.setSpeechRate(0.45);
     _speakCurrentWord();
   }
 
-  Future<void> _initSpeech() async {
-    debugPrint('DEBUG: Initializing Speech...');
-    await _speech.initialize(
-      onError: (e) {
-        debugPrint('DEBUG: Speech Error: ${e.errorMsg}');
-        if (e.errorMsg == 'error_no_match' ||
-            e.errorMsg == 'error_speech_timeout') {
-          return;
-        }
-        if (mounted) setState(() => _isListening = false);
-      },
-      onStatus: (status) {
-        debugPrint('DEBUG: Speech Status: $status');
-        // Only reset when speech recognition is fully completed.
-        if (status == 'done' && mounted) {
-          setState(() => _isListening = false);
-        }
-      },
-      debugLogging: true,
-    );
-  }
-
-  Future<void> _speakCurrentWord() async {
-    await _tts.speak(_currentWord);
-  }
+  Future<void> _speakCurrentWord() async => _tts.speak(_currentWord);
 
   Future<void> _repeatCurrentWord() async {
     if (!mounted) return;
-
-    setState(() {
-      _isReplaying = true;
-    });
-
+    setState(() => _isReplaying = true);
     await _tts.stop();
     await _speakCurrentWord();
-
     Future.delayed(const Duration(milliseconds: 380), () {
-      if (mounted) {
-        setState(() {
-          _isReplaying = false;
-        });
-      }
+      if (mounted) setState(() => _isReplaying = false);
     });
   }
 
-  Future<void> _startListening() async {
-    debugPrint('DEBUG: --- Start Listening Process ---');
-    
+  // ── Speech initializer (safe, idempotent) ──────────────────────────────────
+  Future<bool> _initSpeech() async {
+    if (_speechReady) return true;        // Already good → skip
+    if (_initializing) return false;      // In progress → skip
+
+    if (mounted) setState(() => _initializing = true);
+    debugPrint('STT: initializing…');
+
+    try {
+      final ok = await _speech.initialize(
+        onError: _onSpeechError,
+        onStatus: _onSpeechStatus,
+        debugLogging: true,
+      );
+
+      if (!mounted) return false;
+
+      if (ok) {
+        setState(() {
+          _speechReady = true;
+          _micError = _MicError.none;
+        });
+        debugPrint('STT: ready');
+      } else {
+        // initialize() returned false → likely a permanent permission issue.
+        setState(() => _micError = _MicError.permission);
+        debugPrint('STT: initialization failed (permission?)');
+      }
+      return ok;
+    } catch (e) {
+      debugPrint('STT: initialization exception → $e');
+      if (mounted) setState(() => _micError = _MicError.unknown);
+      return false;
+    } finally {
+      if (mounted) setState(() => _initializing = false);
+    }
+  }
+
+  // ── STT callbacks ──────────────────────────────────────────────────────────
+  void _onSpeechError(dynamic error) {
+    // `error` is SpeechRecognitionError with fields: errorMsg, permanent.
+    final msg = (error as dynamic).errorMsg as String? ?? '';
+    debugPrint('STT error: $msg (permanent: ${error.permanent})');
+
+    _MicError mapped;
+    switch (msg) {
+      case 'error_permission':
+      case 'error_audio_record_permission':
+        mapped = _MicError.permission;
+        // Permission errors invalidate the session → force re-init next time.
+        _speechReady = false;
+        break;
+      case 'error_busy':
+      case 'error_recognizer_busy':
+        mapped = _MicError.busy;
+        break;
+      case 'error_audio':
+      case 'error_audio_focus':
+        mapped = _MicError.audio;
+        break;
+      case 'error_network':
+      case 'error_network_timeout':
+        mapped = _MicError.network;
+        break;
+      case 'error_no_match':
+      // Not really an error — just nothing was understood.
+        mapped = _MicError.noMatch;
+        break;
+      case 'error_speech_timeout':
+        mapped = _MicError.timeout;
+        break;
+      default:
+        mapped = _MicError.unknown;
+    }
+
     if (mounted) {
       setState(() {
-        _isListening = true;
-        _correct = false;
-        _wrong = false;
-        _wrongPulse = 0;
-        _heard = '';
+        _isListening = false;
+        _micError = mapped;
       });
     }
+  }
+
+  void _onSpeechStatus(String status) {
+    debugPrint('STT status: $status');
+    // Both 'done' and 'notListening' mark the end of a session.
+    if ((status == 'done' || status == 'notListening') && mounted) {
+      setState(() => _isListening = false);
+    }
+  }
+
+  // ── Start listening ────────────────────────────────────────────────────────
+  Future<void> _startListening() async {
+    debugPrint('STT: mic button tapped');
+
+    // Ensure the engine is ready.
+    if (!_speechReady) {
+      final ok = await _initSpeech();
+      if (!ok) return; // Error already set in _initSpeech.
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _isListening = true;
+      _correct = false;
+      _wrong = false;
+      _wrongPulse = 0;
+      _heard = '';
+      _micError = _MicError.none;
+    });
 
     try {
       await _tts.stop();
-      
-      // Detener sesión previa si existe de forma más segura
+
+      // Stop any leftover session defensively.
       if (_speech.isListening) {
         await _speech.stop();
-      }
-      
-      // Un pequeño delay para que el hardware del micro se libere
-      await Future.delayed(const Duration(milliseconds: 250));
-
-      if (!_speech.isAvailable) {
-        debugPrint('DEBUG: Speech not available, re-initializing...');
-        final initialized = await _speech.initialize(
-          onError: (e) {
-            debugPrint('DEBUG: Speech Error: ${e.errorMsg}');
-            if (e.errorMsg == 'error_no_match' || e.errorMsg == 'error_speech_timeout') return;
-            if (mounted) setState(() => _isListening = false);
-          },
-          onStatus: (status) {
-            debugPrint('DEBUG: Speech Status: $status');
-            if ((status == 'done' || status == 'notListening') && mounted) {
-              setState(() => _isListening = false);
-            }
-          },
-        );
-        if (!initialized) {
-          if (mounted) setState(() => _isListening = false);
-          return;
-        }
+        await Future.delayed(const Duration(milliseconds: 200));
       }
 
-      debugPrint('DEBUG: Calling _speech.listen...');
       await _speech.listen(
-        onResult: (result) {
-          // Solo procesamos y loagueamos cuando el resultado es final
-          if (result.finalResult) {
-            debugPrint('DEBUG: Speech Result (Final): "${result.recognizedWords}"');
-            if (mounted) {
-              final spoken = result.recognizedWords.trim().toLowerCase();
-              setState(() {
-                _heard = spoken;
-                _isListening = false;
-              });
-              if (spoken.isNotEmpty) {
-                _checkAnswer(spoken);
-              }
-            }
-          } else {
-            // Log opcional para ver el progreso sin ensuciar tanto
-            debugPrint('DEBUG: Partial: "${result.recognizedWords}"');
-          }
-        },
+        onResult: _onSpeechResult,
         localeId: 'en-US',
-        listenFor: _listenForDuration,
-        pauseFor: const Duration(seconds: 3), // Un poco más corto para mayor respuesta
+        listenFor: _listenFor,
+        pauseFor: _pauseFor,
         listenOptions: stt.SpeechListenOptions(
-          listenMode: stt.ListenMode.dictation, // Cambiado a dictation para mayor fluidez
+          listenMode: stt.ListenMode.dictation,
           cancelOnError: false,
           partialResults: false,
           onDevice: false,
         ),
       );
     } catch (e) {
-      debugPrint('DEBUG: Error in _startListening: $e');
-      if (mounted) setState(() => _isListening = false);
+      debugPrint('STT: listen() exception → $e');
+      if (mounted) {
+        setState(() {
+          _isListening = false;
+          _micError = _MicError.unknown;
+        });
+      }
     }
   }
 
+  // ── Cancel listening ───────────────────────────────────────────────────────
   Future<void> _cancelListening() async {
-    debugPrint('DEBUG: Manual listening cancel requested.');
+    debugPrint('STT: manual cancel');
     try {
-      await _speech.stop();
-      await _speech.cancel();
+      if (_speech.isListening) await _speech.stop();
     } catch (e) {
-      debugPrint('DEBUG: Error while canceling listening: $e');
+      debugPrint('STT: cancel exception → $e');
     }
-    if (mounted) {
-      setState(() {
-        _isListening = false;
-      });
+    if (mounted) setState(() => _isListening = false);
+  }
+
+  // ── Result handler ─────────────────────────────────────────────────────────
+  void _onSpeechResult(dynamic result) {
+    if (!(result.finalResult as bool)) {
+      debugPrint('STT partial: "${result.recognizedWords}"');
+      return;
+    }
+
+    final spoken = (result.recognizedWords as String).trim().toLowerCase();
+    debugPrint('STT final: "$spoken"');
+
+    if (!mounted) return;
+    setState(() {
+      _heard = spoken;
+      _isListening = false;
+      _micError = _MicError.none;
+    });
+
+    if (spoken.isNotEmpty) {
+      _checkAnswer(spoken);
+    } else {
+      // Engine returned a final result with an empty string.
+      setState(() => _micError = _MicError.noMatch);
     }
   }
 
+  // ── Answer logic ───────────────────────────────────────────────────────────
   void _checkAnswer(String spokenText) {
     final expected = _currentWord.toLowerCase();
     final spoken = spokenText.toLowerCase();
 
-    //.1 Math match first
     bool isCorrect = spoken == expected || spoken.contains(expected);
-    if (!isCorrect) {
-      final encoder = DoubleMetaphone();
-      final expectedCode = encoder.encode(expected);
-      final spokenCode = encoder.encode(spoken);
 
-      if (spokenCode != null && expectedCode != null) {
-        isCorrect =
-            spokenCode.primary == expectedCode.primary ||
-                (expectedCode.alternates?.contains(spokenCode.primary) ?? false) ||
-                (spokenCode.alternates?.contains(expectedCode.primary) ?? false);
+    if (!isCorrect) {
+      try {
+        final encoder = DoubleMetaphone();
+        final expectedCode = encoder.encode(expected);
+        final spokenCode = encoder.encode(spoken);
+
+        if (spokenCode != null && expectedCode != null) {
+          isCorrect =
+              spokenCode.primary == expectedCode.primary ||
+                  (expectedCode.alternates?.contains(spokenCode.primary) ?? false) ||
+                  (spokenCode.alternates?.contains(expectedCode.primary) ?? false);
+        }
+      } catch (e) {
+        debugPrint('Phonetics error: $e');
       }
     }
+
     if (isCorrect) {
-      if (mounted) {
-        setState(() {
-          _correct = true;
-          _wrong = false;
-          _attempts = 0;
-          _correctCount++;
-        });
-        _animController.forward();
-      }
+      _correctWords.add(_currentWord);
+      setState(() {
+        _correct = true;
+        _wrong = false;
+        _attempts = 0;
+      });
+      _animController.forward();
       Future.delayed(const Duration(milliseconds: 800), _nextWord);
-    }else{
-      if (mounted) {
-        setState(() {
-          _wrong = true;
-          _attempts++;
-          _wrongPulse++;
-        });
-      }
+    } else {
+      setState(() {
+        _wrong = true;
+        _attempts++;
+        _wrongPulse++;
+      });
+
       if (_attempts >= _maxAttempts) {
+        _wrongWords.add(_currentWord);
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text('The correct answer was: $_currentWord'),
-                duration: const Duration(seconds: 3),
+              duration: const Duration(seconds: 3),
             ),
           );
         }
@@ -260,9 +379,11 @@ with SingleTickerProviderStateMixin{
     }
   }
 
+  // ── Navigation ─────────────────────────────────────────────────────────────
   void _nextWord() {
     if (!mounted) return;
     _animController.reset();
+
     if (_currentWordIndex < widget.words.length - 1) {
       setState(() {
         _currentWordIndex++;
@@ -271,6 +392,7 @@ with SingleTickerProviderStateMixin{
         _attempts = 0;
         _heard = '';
         _wrongPulse = 0;
+        _micError = _MicError.none;
       });
       _speakCurrentWord();
     } else {
@@ -278,100 +400,27 @@ with SingleTickerProviderStateMixin{
     }
   }
 
+  // ── Finished dialog ────────────────────────────────────────────────────────
   void _showFinished() {
-    final double percentage = _correctCount / widget.words.length;
-    final bool isExcellent = percentage >= 0.8;
-
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (_) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-        title: Column(
-          children: [
-            Icon(
-              isExcellent ? Icons.stars : Icons.emoji_events,
-              color: Colors.orange,
-              size: 60,
-            ),
-            const SizedBox(height: 16),
-            const Text(
-              'Level Completed!',
-              style: TextStyle(fontWeight: FontWeight.bold),
-              textAlign: TextAlign.center,
-            ),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              'You got $_correctCount out of ${widget.words.length} words correct',
-              style: TextStyle(fontSize: 16, color: Colors.grey.shade700),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 24),
-            Stack(
-              alignment: Alignment.center,
-              children: [
-                SizedBox(
-                  height: 12,
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(10),
-                    child: LinearProgressIndicator(
-                      value: percentage,
-                      backgroundColor: Colors.grey.shade200,
-                      color: percentage > 0.7 
-                          ? Colors.green.shade400 
-                          : (percentage > 0.4 ? Colors.orange.shade400 : Colors.red.shade400),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              '${(percentage * 100).toInt()}% Score',
-              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-            ),
-          ],
-        ),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: Center(
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.pop(context);
-                  Navigator.pop(context);
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.black,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 12),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                ),
-                child: const Text('Finish'),
-              ),
-            ),
-          ),
-        ],
+      builder: (_) => _ResultsDialog(
+        totalWords: widget.words.length,
+        correctWords: List.unmodifiable(_correctWords),
+        wrongWords: List.unmodifiable(_wrongWords),
+        onFinish: () {
+          Navigator.pop(context);
+          Navigator.pop(context);
+        },
       ),
     );
   }
 
-  @override
-  void dispose() {
-    _animController.dispose();
-    _tts.stop();
-    _speech.stop();
-    super.dispose();
-  }
-
+  // ── Build ──────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    final int remainingAttempts =
-        (_maxAttempts - _attempts).clamp(0, _maxAttempts).toInt();
+    final int remaining = (_maxAttempts - _attempts).clamp(0, _maxAttempts);
 
     return Scaffold(
       backgroundColor: const Color(0xFFF5F5F5),
@@ -385,6 +434,7 @@ with SingleTickerProviderStateMixin{
         padding: const EdgeInsets.all(24),
         child: Column(
           children: [
+            // ── Progress ────────────────────────────────────────────────────
             Text(
               '${_currentWordIndex + 1}/${widget.words.length}',
               style: TextStyle(fontSize: 14, color: Colors.grey.shade500),
@@ -396,198 +446,138 @@ with SingleTickerProviderStateMixin{
               color: Colors.black87,
               borderRadius: BorderRadius.circular(4),
             ),
+
             const Spacer(),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  'Repeat the word',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.grey.shade700,
-                  ),
-                ),
-              ],
+
+            // ── Instruction ─────────────────────────────────────────────────
+            Text(
+              'Repeat the word',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.w600,
+                color: Colors.grey.shade700,
+              ),
             ),
             const SizedBox(height: 12),
+
+            // ── Word card ────────────────────────────────────────────────────
             AnimatedSwitcher(
               duration: const Duration(milliseconds: 700),
               switchInCurve: Curves.easeOutCubic,
               switchOutCurve: Curves.easeInCubic,
-              transitionBuilder: (child, animation) {
-                final slide = Tween<Offset>(
-                  begin: const Offset(0.18, 0),
-                  end: Offset.zero,
-                ).animate(animation);
-
-                return FadeTransition(
-                  opacity: animation,
-                  child: SlideTransition(
-                    position: slide,
-                    child: child,
-                  ),
-                );
-              },
+              transitionBuilder: (child, animation) => FadeTransition(
+                opacity: animation,
+                child: SlideTransition(
+                  position: Tween<Offset>(
+                    begin: const Offset(0.18, 0),
+                    end: Offset.zero,
+                  ).animate(animation),
+                  child: child,
+                ),
+              ),
               child: AnimatedBuilder(
                 key: ValueKey('$_currentWordIndex-$_wrongPulse'),
                 animation: _animController,
-                builder: (context, child) {
-                  return AnimatedScale(
-                    scale: _isReplaying ? 1.03 : 1.0,
-                    duration: const Duration(milliseconds: 280),
-                    curve: Curves.easeOut,
-                    child: Material(
-                      color: Colors.transparent,
-                      child: InkWell(
-                        onTap: _repeatCurrentWord,
-                        borderRadius: BorderRadius.circular(16),
-                        child: Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.symmetric(vertical: 100, horizontal: 32),
-                          decoration: BoxDecoration(
+                builder: (context, _) => AnimatedScale(
+                  scale: _isReplaying ? 1.03 : 1.0,
+                  duration: const Duration(milliseconds: 280),
+                  curve: Curves.easeOut,
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      onTap: _repeatCurrentWord,
+                      borderRadius: BorderRadius.circular(16),
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(
+                            vertical: 100, horizontal: 32),
+                        decoration: BoxDecoration(
+                          color: _correct
+                              ? _bgAnim.value
+                              : _wrong
+                              ? const Color(0xFFFFEBEE)
+                              : _isReplaying
+                              ? const Color(0xFFF7FAFF)
+                              : Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
                             color: _correct
-                                ? _bgColor.value
+                                ? (_borderAnim.value ?? Colors.green.shade300)
                                 : _wrong
-                                    ? const Color(0xFFFFEBEE)
+                                ? Colors.red.shade300
                                 : _isReplaying
-                                    ? const Color(0xFFF7FAFF)
-                                    : Colors.white,
-                            borderRadius: BorderRadius.circular(16),
-                            border: Border.all(
-                              color: _correct
-                                  ? (_borderControl.value ?? Colors.green.shade300)
-                                  : _wrong
-                                      ? Colors.red.shade300
-                                  : _isReplaying
-                                      ? Colors.blue.shade200
-                                      : Colors.grey.shade200,
-                              width: _correct || _wrong || _isReplaying ? 1.5 : 0.5,
+                                ? Colors.blue.shade200
+                                : Colors.grey.shade200,
+                            width:
+                            _correct || _wrong || _isReplaying ? 1.5 : 0.5,
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: _isReplaying
+                                  ? Colors.blue.withValues(alpha: 0.10)
+                                  : Colors.black.withValues(alpha: 0.04),
+                              blurRadius: _isReplaying ? 14 : 10,
+                              offset: const Offset(0, 3),
                             ),
-                            boxShadow: [
-                              BoxShadow(
-                                color: _isReplaying
-                                    ? Colors.blue.withValues(alpha: 0.10)
-                                    : Colors.black.withValues(alpha: 0.04),
-                                blurRadius: _isReplaying ? 14 : 10,
-                                offset: const Offset(0, 3),
-                              ),
-                            ],
-                          ),
-                          child: Column(
-                            children: [
-                              Text(
-                                _currentWord,
-                                style: const TextStyle(
-                                  fontSize: 60,
-                                  fontWeight: FontWeight.w500,
-                                  letterSpacing: 1,
-                                ),
-                              ),
-                              const SizedBox(height: 16),
-                              Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    Icons.volume_up_outlined,
-                                    color: Colors.grey.shade500,
-                                    size: 18,
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Text(
-                                    'Tap anywhere to hear again',
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      color: Colors.grey.shade500,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
+                          ],
                         ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ),
-
-            /*const SizedBox(height: 16,),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.grey.shade300, width: 0.5),
-              ),
-              child: const Text(
-                ' sfs dv ',
-                textAlign: TextAlign.center,
-              ),
-            ),*/
-            const SizedBox(height: 24),
-            if (_wrong)
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFFFF4F4),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.red.shade200, width: 1),
-                ),
-                child: Column(
-                  children: [
-                    Text(
-                      'Pronunciation not clear',
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w700,
-                        color: Colors.red.shade700,
-                      ),
-                    ),
-                    if (_heard.isNotEmpty) ...[
-                      const SizedBox(height: 6),
-                      RichText(
-                        textAlign: TextAlign.center,
-                        text: TextSpan(
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: Colors.red.shade800,
-                          ),
+                        child: Column(
                           children: [
-                            const TextSpan(text: 'You said: '),
-                            TextSpan(
-                              text: _heard,
-                              style: const TextStyle(fontWeight: FontWeight.w700),
+                            Text(
+                              _currentWord,
+                              style: const TextStyle(
+                                fontSize: 60,
+                                fontWeight: FontWeight.w500,
+                                letterSpacing: 1,
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.volume_up_outlined,
+                                    color: Colors.grey.shade500, size: 18),
+                                const SizedBox(width: 6),
+                                Text(
+                                  'Tap anywhere to hear again',
+                                  style: TextStyle(
+                                      fontSize: 13,
+                                      color: Colors.grey.shade500),
+                                ),
+                              ],
                             ),
                           ],
                         ),
                       ),
-                    ],
-                    const SizedBox(height: 6),
-                    Text(
-                      'Remaining attempts: $remainingAttempts',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.red.shade700,
-                      ),
                     ),
-                  ],
+                  ),
                 ),
               ),
+            ),
+
+            const SizedBox(height: 24),
+
+            // ── Feedback area ────────────────────────────────────────────────
+            if (_micError != _MicError.none)
+              _MicErrorBanner(
+                error: _micError,
+              )
+            else if (_wrong)
+              _WrongAnswerBanner(
+                heard: _heard,
+                remaining: remaining,
+              ),
+
             const Spacer(),
-            // Speak button
+
+            // ── Mic button ───────────────────────────────────────────────────
             GestureDetector(
               onTap: () {
-                debugPrint('DEBUG: Mic button tapped. _isListening: $_isListening');
                 if (_isListening) {
                   _cancelListening();
-                  return;
+                } else {
+                  _startListening();
                 }
-                _startListening();
               },
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 220),
@@ -602,33 +592,392 @@ with SingleTickerProviderStateMixin{
                   child: AnimatedSwitcher(
                     duration: const Duration(milliseconds: 180),
                     child: _isListening
-                        ? const Icon(
-                            key: ValueKey('cancel-recording'),
-                            Icons.stop_circle_outlined,
-                            color: Colors.white,
-                            size: 30,
-                          )
-                        : const Icon(
-                            key: ValueKey('start-mic'),
-                            Icons.mic_none,
-                            color: Colors.white,
-                            size: 32,
-                          ),
+                        ? const Icon(Icons.stop_circle_outlined,
+                        key: ValueKey('stop'),
+                        color: Colors.white,
+                        size: 30)
+                        : const Icon(Icons.mic_none,
+                        key: ValueKey('mic'),
+                        color: Colors.white,
+                        size: 32),
                   ),
                 ),
               ),
             ),
             const SizedBox(height: 12),
             Text(
-              _isListening ? 'Recording... tap to cancel' : 'Tap to speak',
-              style: TextStyle(
-                fontSize: 14,
-                color: Colors.grey.shade500,
-              ),
+              _isListening
+                  ? 'Recording… tap to cancel'
+                  : _initializing
+                  ? 'Preparing microphone…'
+                  : 'Tap to speak',
+              style: TextStyle(fontSize: 14, color: Colors.grey.shade500),
             ),
             const SizedBox(height: 32),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ─── Results dialog ──────────────────────────────────────────────────────────
+class _ResultsDialog extends StatelessWidget {
+  final int totalWords;
+  final List<String> correctWords;
+  final List<String> wrongWords;
+  final VoidCallback onFinish;
+
+  const _ResultsDialog({
+    required this.totalWords,
+    required this.correctWords,
+    required this.wrongWords,
+    required this.onFinish,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final int correctCount = correctWords.length;
+    final double pct = totalWords > 0 ? correctCount / totalWords : 0;
+    final bool isExcellent = pct >= 0.8;
+
+    final Color progressColor = pct > 0.7
+        ? Colors.green.shade400
+        : pct > 0.4
+            ? Colors.orange.shade400
+            : Colors.red.shade400;
+
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 32),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(24, 28, 24, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Icon(
+                isExcellent ? Icons.stars_rounded : Icons.emoji_events_rounded,
+                color: Colors.orange.shade400,
+                size: 52,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Center(
+              child: Text(
+                'Level completed!',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey.shade900,
+                ),
+              ),
+            ),
+            const SizedBox(height: 4),
+            Center(
+              child: Text(
+                'You got $correctCount out of $totalWords words correct',
+                style: TextStyle(fontSize: 13, color: Colors.grey.shade500),
+                textAlign: TextAlign.center,
+              ),
+            ),
+            const SizedBox(height: 20),
+            Row(
+              children: [
+                Expanded(
+                  child: _ScorePill(
+                    count: correctCount,
+                    label: 'Correct',
+                    background: const Color(0xFFEAF3DE),
+                    countColor: const Color(0xFF3B6D11),
+                    labelColor: const Color(0xFF639922),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _ScorePill(
+                    count: wrongWords.length,
+                    label: 'Wrong',
+                    background: const Color(0xFFFCEBEB),
+                    countColor: const Color(0xFFA32D2D),
+                    labelColor: const Color(0xFFE24B4A),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 20),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: SizedBox(
+                height: 8,
+                child: LinearProgressIndicator(
+                  value: pct,
+                  backgroundColor: Colors.grey.shade100,
+                  color: progressColor,
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('${(pct * 100).toInt()}% score',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+                Text('$correctCount / $totalWords',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+              ],
+            ),
+            const SizedBox(height: 22),
+            if (correctWords.isNotEmpty) ...[
+              _SectionLabel(label: 'Correct', color: const Color(0xFF639922)),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: correctWords
+                    .map((w) => _WordChip(
+                          word: w,
+                          background: const Color(0xFFEAF3DE),
+                          textColor: const Color(0xFF3B6D11),
+                        ))
+                    .toList(),
+              ),
+              const SizedBox(height: 18),
+            ],
+            if (wrongWords.isNotEmpty) ...[
+              _SectionLabel(label: 'Needs practice', color: const Color(0xFFE24B4A)),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: wrongWords
+                    .map((w) => _WordChip(
+                          word: w,
+                          background: const Color(0xFFFCEBEB),
+                          textColor: const Color(0xFFA32D2D),
+                        ))
+                    .toList(),
+              ),
+              const SizedBox(height: 18),
+            ],
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: onFinish,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.black,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                  elevation: 0,
+                ),
+                child: const Text(
+                  'Finish',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Small reusable widgets ──────────────────────────────────────────────────
+class _ScorePill extends StatelessWidget {
+  final int count;
+  final String label;
+  final Color background;
+  final Color countColor;
+  final Color labelColor;
+
+  const _ScorePill({
+    required this.count,
+    required this.label,
+    required this.background,
+    required this.countColor,
+    required this.labelColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        children: [
+          Text(
+            '$count',
+            style: TextStyle(
+              fontSize: 26,
+              fontWeight: FontWeight.w600,
+              color: countColor,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            label,
+            style: TextStyle(fontSize: 12, color: labelColor),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SectionLabel extends StatelessWidget {
+  final String label;
+  final Color color;
+
+  const _SectionLabel({required this.label, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      label.toUpperCase(),
+      style: TextStyle(
+        fontSize: 11,
+        fontWeight: FontWeight.w600,
+        color: color,
+        letterSpacing: 0.8,
+      ),
+    );
+  }
+}
+
+class _WordChip extends StatelessWidget {
+  final String word;
+  final Color background;
+  final Color textColor;
+
+  const _WordChip({
+    required this.word,
+    required this.background,
+    required this.textColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(
+        word,
+        style: TextStyle(
+          fontSize: 13,
+          fontWeight: FontWeight.w500,
+          color: textColor,
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Error banner widget ──────────────────────────────────────────────────────
+class _MicErrorBanner extends StatelessWidget {
+  final _MicError error;
+
+  const _MicErrorBanner({required this.error});
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isPermission = error.requiresSettings;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF8E1),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.orange.shade300),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Icon(
+                isPermission ? Icons.mic_off : Icons.warning_amber_rounded,
+                color: Colors.orange.shade700,
+                size: 18,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  error.message,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.orange.shade800,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─── Wrong answer banner widget ───────────────────────────────────────────────
+class _WrongAnswerBanner extends StatelessWidget {
+  final String heard;
+  final int remaining;
+
+  const _WrongAnswerBanner({required this.heard, required this.remaining});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF4F4),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.red.shade200),
+      ),
+      child: Column(
+        children: [
+          Text(
+            'Pronunciation not clear',
+            style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+                color: Colors.red.shade700),
+          ),
+          if (heard.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            RichText(
+              textAlign: TextAlign.center,
+              text: TextSpan(
+                style: TextStyle(fontSize: 14, color: Colors.red.shade800),
+                children: [
+                  const TextSpan(text: 'You said: '),
+                  TextSpan(
+                    text: heard,
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          const SizedBox(height: 6),
+          Text(
+            'Remaining attempts: $remaining',
+            style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: Colors.red.shade700),
+          ),
+        ],
       ),
     );
   }
